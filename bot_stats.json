@@ -9,5 +9,19 @@
       "start": 1
     },
     "total_unique": 1
+  },
+  "2026-02-23": {
+    "unique_users": [
+      7530718780,
+      2122585462,
+      5560558079
+    ],
+    "games_started": 2,
+    "games_finished": 2,
+    "commands_used": {
+      "game": 2,
+      "vote": 2
+    },
+    "total_unique": 3
   }
 }

@@ -22,6 +22,7 @@ from aiogram.enums import ParseMode
 
 BOT_TOKEN = "8090010535:AAEsAeC1LtfKzSbvLcRaugca0mNC2I8_Paw"
 ADMIN_ID = 5560558079  # ← ТВОЙ ID
+VOTING_TIMEOUT = 60  # секунд на голосование
 
 logging.basicConfig(
     level=logging.INFO,
@@ -346,6 +347,7 @@ class GameRoom:
     votes: Dict[int, int] = field(default_factory=dict)
     descriptions_done: List[int] = field(default_factory=list)
     spy_guess_used: bool = False
+    voting_task: Optional[asyncio.Task] = None  # ← задача таймера голосования
 
 # ==================== МЕНЕДЖЕР ====================
 
@@ -970,7 +972,9 @@ async def start_voting(chat_id: int, game: GameRoom):
     
     await bot.send_message(
         chat_id,
-        f"{desc}\n🗳 <b>ГОЛОСОВАНИЕ!</b>\nКто шпион? Каждый голосует через свою кнопку ниже:",
+        f"{desc}\n🗳 <b>ГОЛОСОВАНИЕ!</b>\n"
+        f"⏰ У вас <b>{VOTING_TIMEOUT} секунд</b>!\n"
+        f"Кто шпион? Каждый голосует через свою кнопку ниже:",
         parse_mode=ParseMode.HTML
     )
     
@@ -986,6 +990,44 @@ async def start_voting(chat_id: int, game: GameRoom):
                 )
             except Exception as e:
                 logger.error(f"Ошибка отправки кнопок: {e}")
+    
+    # Запускаем таймер голосования
+    game.voting_task = asyncio.create_task(voting_timer(game, chat_id))
+
+async def voting_timer(game: GameRoom, chat_id: int):
+    """Таймер голосования - если не проголосовал, голос отдаётся случайно"""
+    await asyncio.sleep(VOTING_TIMEOUT)
+    
+    # Проверяем, не завершилось ли голосование раньше
+    if game.state != GameState.VOTING:
+        return
+    
+    # Находим тех, кто не проголосовал
+    non_voters = [pid for pid, p in game.players.items() if not p.has_voted]
+    
+    if non_voters:
+        # Случайно распределяем голоса непроголосовавших
+        for voter_id in non_voters:
+            # Выбираем случайную цель (кроме самого себя)
+            possible_targets = [pid for pid in game.players.keys() if pid != voter_id]
+            if possible_targets:
+                target_id = random.choice(possible_targets)
+                
+                game.votes[voter_id] = target_id
+                game.players[voter_id].has_voted = True
+                game.players[target_id].votes_received += 1
+                
+                await bot.send_message(
+                    chat_id,
+                    f"⏰ <b>{game.players[voter_id].full_name}</b> не успел проголосовать!\n"
+                    f"🎲 Случайный голос против <b>{game.players[target_id].full_name}</b>",
+                    parse_mode=ParseMode.HTML
+                )
+        
+        # Проверяем, все ли теперь проголосовали
+        voted_count = sum(1 for p in game.players.values() if p.has_voted)
+        if voted_count >= len(game.players):
+            await end_voting(game)
 
 @dp.callback_query(F.data.startswith("vote_"))
 async def cb_vote(callback: types.CallbackQuery):
@@ -1027,9 +1069,20 @@ async def cb_vote(callback: types.CallbackQuery):
     )
     
     if voted_count >= len(game.players):
+        # Отменяем таймер, если все проголосовали досрочно
+        if game.voting_task and not game.voting_task.done():
+            game.voting_task.cancel()
+            try:
+                await game.voting_task
+            except asyncio.CancelledError:
+                pass
+        
         await end_voting(game)
 
 async def end_voting(game: GameRoom):
+    # Очищаем задачу таймера
+    game.voting_task = None
+    
     max_votes = -1
     suspects = []
     
@@ -1058,10 +1111,19 @@ async def end_voting(game: GameRoom):
         await end_game(game, "spy", f"Ошибка! {suspected.full_name} не шпион. Шпион был {spy.full_name}")
 
 async def end_game(game: GameRoom, winner: str, reason: str):
+    # Отменяем таймер, если он ещё активен
+    if game.voting_task and not game.voting_task.done():
+        game.voting_task.cancel()
+        try:
+            await game.voting_task
+        except asyncio.CancelledError:
+            pass
+    
     # Логируем завершение игры
     stats_manager.log_game_end()
     
     game.state = GameState.FINISHED
+    game.voting_task = None
     spy = game.players[game.spy_id]
     
     category_name = CATEGORIES.get(game.selected_category, game.selected_category)
